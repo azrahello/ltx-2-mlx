@@ -1,0 +1,5 @@
+*.mp4
+*.wav
+*.npy
+*.log
+.*.log
