@@ -5,16 +5,23 @@ that an upstream-sync fix produces the expected delta and nothing else.
 
 ## What it captures
 
-Three goldens (see `config.py`):
+Two goldens (see `config.py`):
 
 | ID            | Pipeline                | Covers                                |
 |---------------|-------------------------|----------------------------------------|
 | `g1_two_stage`| `generate --two-stage`  | DiT, VAE, Vocoder, BWE, Euler+CFG     |
 | `g2_hq`       | `generate --hq`         | + res_2s sampler                       |
-| `g3_keyframe` | `keyframe`              | `VideoConditionByKeyframeIndex` (Fix 2)|
 
 Heavy artifacts (`.mp4`, `.wav`) are gitignored. Only `manifest.json`
 (stats per tag) is committed.
+
+A `g3_keyframe` golden was deliberately removed: the keyframe pipeline
+currently produces a hold-cut-decay pattern (frames stick on keyframe1
+for ~80% of the timeline, jump, then collapse onto keyframe2 over the
+last few frames) instead of smooth interpolation. The bug reproduces on
+the previously-validated hedgehog config and predates the upstream-sync
+work — it will be revisited when Fix 2 (`num_pixel_frames`) lands, since
+that change touches keyframe RoPE positions.
 
 ## Per-fix workflow
 
@@ -36,14 +43,17 @@ python -m tests.regression.verify_no_regression \
 
 ## Expected deltas per fix
 
-| Fix | g1_two_stage video | g1 audio (L1, STFT) | g2_hq video | g2 audio | g3_keyframe video |
-|-----|--------------------|----------------------|-------------|----------|--------------------|
-| **1 — Vocoder fp32** | PSNR ~ inf (identical) | sample L1 >> 1e-2, STFT L1 >> 1e-2 | identical | same delta as g1 | identical |
-| **2 — `num_pixel_frames`** | PSNR ~ inf | identical | PSNR ~ inf | identical | PSNR drops (real change) |
-| **3 — Decoder dtype guard** | PSNR ~ inf | identical | PSNR ~ inf | identical | PSNR ~ inf |
+| Fix | g1_two_stage video | g1 audio (L1, STFT) | g2_hq video | g2 audio |
+|-----|--------------------|----------------------|-------------|----------|
+| **1 — Vocoder fp32** | PSNR = inf (identical) | sample L1 >> 1e-2, STFT L1 >> 1e-2 | identical | same delta as g1 |
+| **2 — `num_pixel_frames`** | PSNR = inf | identical | PSNR = inf | identical |
+| **3 — Decoder dtype guard** | PSNR = inf | identical | PSNR = inf | identical |
 
 If a column says "identical" but PSNR is < 60 dB, the fix has leaked into
 unrelated paths — **stop and investigate**.
+
+Determinism on identical seed: `g1_two_stage` re-run produces PSNR=inf
+and audio L1=0. The strict cap is achievable.
 
 ## A/B audio listening
 
