@@ -71,8 +71,14 @@ class ICLoraPipeline(TextToVideoPipeline):
         lora_paths: list[tuple[str, float]] | None = None,
         gemma_model_id: str = "mlx-community/gemma-3-12b-it-4bit",
         low_memory: bool = True,
+        low_ram_streaming: bool = False,
     ):
-        super().__init__(model_dir, gemma_model_id=gemma_model_id, low_memory=low_memory)
+        super().__init__(
+            model_dir,
+            gemma_model_id=gemma_model_id,
+            low_memory=low_memory,
+            low_ram_streaming=low_ram_streaming,
+        )
         self.vae_encoder: VideoEncoder | None = None
         self.upsampler: LatentUpsampler | None = None
 
@@ -107,16 +113,10 @@ class ICLoraPipeline(TextToVideoPipeline):
 
         # DiT (largest component)
         if self.dit is None:
-            from ltx_core_mlx.model.transformer.model import LTXModel
-
-            self.dit = LTXModel()
             transformer_path = model_dir / "transformer.safetensors"
             if not transformer_path.exists():
                 transformer_path = model_dir / "transformer-distilled.safetensors"
-            transformer_weights = load_split_safetensors(transformer_path, prefix="transformer.")
-            apply_quantization(self.dit, transformer_weights)
-            self.dit.load_weights(list(transformer_weights.items()))
-            aggressive_cleanup()
+            self.dit = self._load_transformer_with_optional_streaming(transformer_path)
 
         # VAE encoder (for encoding control videos and I2V images)
         self._load_vae_encoder()
@@ -144,12 +144,32 @@ class ICLoraPipeline(TextToVideoPipeline):
         """Fuse all LoRA weights into the transformer.
 
         Reads LoRA files, applies ComfyUI key remapping, fuses deltas into
-        model weights, and re-quantizes.
+        model weights, and re-quantizes. In ``low_ram_streaming`` mode
+        the LoRAs are attached as ``BlockLoraSource`` to the streaming
+        wrapper instead of being fused in-place — fusion happens at
+        each block bind.
         """
         if not self._lora_paths:
             return
 
         assert self.dit is not None
+
+        if self.low_ram_streaming:
+            from ltx_core_mlx.loader.block_streaming import BlockLoraSource
+
+            sources: list = list(object.__getattribute__(self.dit, "_lora_sources"))
+            for lora_path, strength in self._lora_paths:
+                sources.append(
+                    BlockLoraSource(
+                        lora_path,
+                        block_prefix="transformer.transformer_blocks.",
+                        strength=strength,
+                        sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+                    )
+                )
+                logger.info(f"Attached LoRA streamer: {lora_path} (strength={strength})")
+            object.__setattr__(self.dit, "_lora_sources", sources)
+            return
 
         import mlx.utils
 
@@ -177,20 +197,27 @@ class ICLoraPipeline(TextToVideoPipeline):
         The reference implementation uses separate ModelLedgers for Stage 1
         (with LoRA) and Stage 2 (clean distilled). We achieve the same by
         discarding the fused transformer and reloading from disk.
+
+        In ``low_ram_streaming`` mode we just clear the LoraSources from
+        the streaming wrapper instead of full reload — the underlying
+        block weights are streamed fresh from the safetensors.
         """
-        from ltx_core_mlx.model.transformer.model import LTXModel
+        if self.low_ram_streaming and self.dit is not None:
+            old_sources = list(object.__getattribute__(self.dit, "_lora_sources"))
+            object.__setattr__(self.dit, "_lora_sources", [])
+            for src in old_sources:
+                src.close()
+            aggressive_cleanup()
+            logger.info("Cleared streaming LoRA sources for Stage 2")
+            return
 
         self.dit = None
         aggressive_cleanup()
 
-        self.dit = LTXModel()
         transformer_path = self.model_dir / "transformer.safetensors"
         if not transformer_path.exists():
             transformer_path = self.model_dir / "transformer-distilled.safetensors"
-        transformer_weights = load_split_safetensors(transformer_path, prefix="transformer.")
-        apply_quantization(self.dit, transformer_weights)
-        self.dit.load_weights(list(transformer_weights.items()))
-        aggressive_cleanup()
+        self.dit = self._load_transformer_with_optional_streaming(transformer_path)
         logger.info("Reloaded clean transformer for Stage 2")
 
     def _create_conditionings(

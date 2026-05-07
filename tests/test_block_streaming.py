@@ -251,3 +251,59 @@ class TestStreamingLTXModel:
             assert mx.allclose(baseline_v, streamed_v, atol=1e-5, rtol=1e-5).item()
             assert mx.allclose(baseline_a, streamed_a, atol=1e-5, rtol=1e-5).item()
             streamer.close()
+
+
+class TestBlockLoraSource:
+    def _build_synthetic_lora(self, model: LTXModel, path: Path, prefix: str) -> None:
+        """Save a minimal A+B pair targeting block 0's attn1.to_q.weight."""
+        block0 = model.transformer_blocks[0]
+        out_dim, in_dim = block0.attn1.to_q.weight.shape
+        rank = 4
+        a = mx.random.normal((rank, in_dim)).astype(mx.bfloat16)
+        b = mx.random.normal((out_dim, rank)).astype(mx.bfloat16) * 0.1
+        out: dict[str, mx.array] = {
+            f"{prefix}0.attn1.to_q.lora_A.weight": a,
+            f"{prefix}0.attn1.to_q.lora_B.weight": b,
+        }
+        mx.save_safetensors(str(path), out)
+
+    def test_bind_with_lora_fuses_delta(self):
+        from ltx_core_mlx.loader.block_streaming import BlockLoraSource
+
+        cfg = _tiny_config(num_layers=2)
+        ref_model = LTXModel(cfg)
+        mx.eval(ref_model.parameters())
+
+        with tempfile.TemporaryDirectory() as td:
+            blocks_path = Path(td) / "blocks.safetensors"
+            lora_path = Path(td) / "lora.safetensors"
+            _save_block_weights_to_safetensors(ref_model, blocks_path, prefix="transformer_blocks.")
+            self._build_synthetic_lora(ref_model, lora_path, prefix="transformer_blocks.")
+
+            streamer = BlockStreamer(blocks_path, block_prefix="transformer_blocks.")
+            lora = BlockLoraSource(lora_path, block_prefix="transformer_blocks.", strength=1.0)
+            assert lora.has_block(0)
+            assert not lora.has_block(1)
+
+            shared = _make_block(cfg)
+
+            # Expected: original + delta = (B @ A) at attn1.to_q.weight.
+            expected_q = (
+                ref_model.transformer_blocks[0].attn1.to_q.weight.astype(mx.float32)
+                + (
+                    lora.get_block_lora_dict(0)["attn1.to_q.lora_B.weight"].astype(mx.float32)
+                    @ lora.get_block_lora_dict(0)["attn1.to_q.lora_A.weight"].astype(mx.float32)
+                )
+            ).astype(ref_model.transformer_blocks[0].attn1.to_q.weight.dtype)
+
+            streamer.bind(shared, 0, lora_sources=[lora])
+            mx.eval(shared.attn1.to_q.weight, expected_q)
+            assert mx.allclose(shared.attn1.to_q.weight, expected_q, atol=1e-5, rtol=1e-5).item()
+
+            # Block 1 has no LoRA → bind should leave weights unchanged.
+            streamer.bind(shared, 1, evict_previous=0, lora_sources=[lora])
+            ref_q1 = ref_model.transformer_blocks[1].attn1.to_q.weight
+            mx.eval(shared.attn1.to_q.weight, ref_q1)
+            assert mx.array_equal(shared.attn1.to_q.weight, ref_q1).item()
+            streamer.close()
+            lora.close()

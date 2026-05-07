@@ -173,40 +173,59 @@ class TwoStagePipeline(TextToVideoPipeline):
         aggressive_cleanup()
 
     def _swap_to_distilled_streamer(self) -> None:
-        """Replace the dev-model streamer with one over ``transformer-distilled.safetensors``.
+        """Switch the streamer to a distilled-LoRA-fused dev model.
 
         Used in ``low_ram_streaming`` mode at the stage 1 → stage 2
-        transition: instead of fusing the distilled LoRA into the
-        materialized dev model (which would force materialization of
-        all 48 blocks), point the streamer at the pre-fused distilled
-        file. mlx-forge produces this file at LoRA strength 1.0; the
-        pipeline raises if a non-default strength is requested.
+        transition. Two strategies depending on requested LoRA
+        strength:
+
+        - **strength == 1.0**: swap to the pre-fused
+          ``transformer-distilled.safetensors`` (mlx-forge produces it
+          at LoRA strength 1.0). Cheaper — just opens a different
+          mmap'd file, no per-block fusion at bind time.
+
+        - **strength != 1.0**: keep streaming the dev model and
+          attach a ``BlockLoraSource`` to the wrapper. Each bind() now
+          dequantizes block weights, adds the LoRA delta at custom
+          strength, and re-quantizes (handled by
+          ``apply_loras`` already used by the non-streaming path).
+          Slower per bind but supports arbitrary LoRA strength.
         """
-        from ltx_core_mlx.loader.block_streaming import BlockStreamer
+        from ltx_core_mlx.loader.block_streaming import BlockLoraSource, BlockStreamer
+        from ltx_core_mlx.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
 
-        if abs(self._distilled_lora_strength - 1.0) > 1e-6:
-            raise NotImplementedError(
-                f"low_ram_streaming requires distilled LoRA strength 1.0 "
-                f"(got {self._distilled_lora_strength}). Custom strengths "
-                f"need on-the-fly LoRA fusion, not yet supported in streaming mode."
-            )
+        if abs(self._distilled_lora_strength - 1.0) <= 1e-6:
+            distilled_path = self.model_dir / "transformer-distilled.safetensors"
+            if not distilled_path.exists():
+                raise FileNotFoundError(
+                    f"Pre-fused distilled transformer not found at {distilled_path}. "
+                    "low_ram_streaming for two-stage at LoRA strength 1.0 requires "
+                    "the distilled file. Use: --model dgrauet/ltx-2.3-mlx-q8"
+                )
+            new_streamer = BlockStreamer(distilled_path, block_prefix="transformer.transformer_blocks.")
+            old_streamer = object.__getattribute__(self.dit, "_streamer")
+            object.__setattr__(self.dit, "_streamer", new_streamer)
+            old_streamer.close()
+            aggressive_cleanup()
+            return
 
-        distilled_path = self.model_dir / "transformer-distilled.safetensors"
-        if not distilled_path.exists():
+        # Custom strength → bind-time LoRA fusion.
+        lora_path = self.model_dir / self._distilled_lora
+        if not lora_path.exists():
             raise FileNotFoundError(
-                f"Pre-fused distilled transformer not found at {distilled_path}. "
-                "low_ram_streaming for two-stage requires the distilled file. "
-                "Use: --model dgrauet/ltx-2.3-mlx-q8"
+                f"Distilled LoRA not found at {lora_path}. "
+                "low_ram_streaming with a non-default LoRA strength requires "
+                "the LoRA safetensors. Use: --model dgrauet/ltx-2.3-mlx-q8"
             )
-
-        # The current self.dit is a StreamingLTXModel wrapping the dev model.
-        # Build a new streamer over the distilled file and rebind the wrapper's
-        # streamer pointer. The shared block instance is reused.
-        new_streamer = BlockStreamer(distilled_path, block_prefix="transformer.transformer_blocks.")
-        # Close the old streamer to release its mmap'd dict.
-        old_streamer = object.__getattribute__(self.dit, "_streamer")
-        object.__setattr__(self.dit, "_streamer", new_streamer)
-        old_streamer.close()
+        lora_source = BlockLoraSource(
+            lora_path,
+            block_prefix="transformer.transformer_blocks.",
+            strength=self._distilled_lora_strength,
+            sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+        )
+        existing = list(object.__getattribute__(self.dit, "_lora_sources"))
+        existing.append(lora_source)
+        object.__setattr__(self.dit, "_lora_sources", existing)
         aggressive_cleanup()
 
     def _load_upsampler(self, name: str = "spatial_upscaler_x2_v1_1") -> None:

@@ -39,7 +39,85 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-__all__ = ["BlockStreamer", "StreamingLTXModel"]
+__all__ = ["BlockLoraSource", "BlockStreamer", "StreamingLTXModel"]
+
+
+class BlockLoraSource:
+    """Per-block LoRA A/B matrices indexed by block index.
+
+    Streams LoRA A/B pairs from a memory-mapped safetensors file and
+    indexes them by block index so :meth:`BlockStreamer.bind` can fuse
+    the matching delta into a streamed block on the fly.
+
+    Args:
+        lora_path: Path to LoRA safetensors.
+        block_prefix: Same prefix as the streamer (e.g.
+            ``"transformer.transformer_blocks."``). LoRA keys after
+            optional ``sd_ops`` remapping must start with this prefix
+            and be of the form ``f"{block_prefix}{idx}.{param}.lora_A.weight"``.
+        strength: LoRA fusion strength (default 1.0).
+        sd_ops: Optional :class:`SDOps` to remap raw safetensors keys
+            (e.g. ComfyUI/diffusers → MLX naming via
+            ``LTXV_LORA_COMFY_RENAMING_MAP``).
+    """
+
+    def __init__(
+        self,
+        lora_path: str | Path,
+        block_prefix: str,
+        strength: float = 1.0,
+        sd_ops=None,
+    ) -> None:
+        self.strength = strength
+        self.block_prefix = block_prefix
+        self._lora_path = str(lora_path)
+        self._sd_ops = sd_ops
+        self._lora_data = mx.load(self._lora_path)
+
+        # block_idx -> param_name -> {"a": full_key, "b": full_key}
+        self._block_keys: dict[int, dict[str, dict[str, str]]] = {}
+        for raw_key in self._lora_data:
+            model_key = sd_ops.apply_to_key(raw_key) if sd_ops is not None else raw_key
+            if model_key is None or not model_key.startswith(block_prefix):
+                continue
+            rest = model_key[len(block_prefix) :]
+            idx_str, _, param_path = rest.partition(".")
+            try:
+                block_idx = int(idx_str)
+            except ValueError:
+                continue
+            for suffix, slot in ((".lora_A.weight", "a"), (".lora_B.weight", "b")):
+                if param_path.endswith(suffix):
+                    param_name = param_path[: -len(suffix)]
+                    self._block_keys.setdefault(block_idx, {}).setdefault(param_name, {})[slot] = raw_key
+                    break
+
+    def has_block(self, block_idx: int) -> bool:
+        """Return True iff the LoRA contains at least one matched A/B pair for block_idx."""
+        block = self._block_keys.get(block_idx)
+        if not block:
+            return False
+        return any("a" in slots and "b" in slots for slots in block.values())
+
+    def get_block_lora_dict(self, block_idx: int) -> dict[str, mx.array]:
+        """Return per-block LoRA dict shaped like ``{param.lora_A.weight: array, ...}``.
+
+        The keys use the param name relative to the block (the same keys
+        that :meth:`BlockStreamer.bind` would load). ``apply_loras`` from
+        ``ltx_core_mlx.loader.fuse_loras`` consumes this format directly.
+        """
+        out: dict[str, mx.array] = {}
+        block = self._block_keys.get(block_idx, {})
+        for param_name, slots in block.items():
+            if "a" not in slots or "b" not in slots:
+                continue
+            out[f"{param_name}.lora_A.weight"] = self._lora_data[slots["a"]]
+            out[f"{param_name}.lora_B.weight"] = self._lora_data[slots["b"]]
+        return out
+
+    def close(self) -> None:
+        self._lora_data = {}
+        self._block_keys = {}
 
 
 class BlockStreamer:
@@ -110,7 +188,13 @@ class BlockStreamer:
             raise KeyError(f"block {idx} not in streamer (have {sorted(self._block_key_map)})")
         return [param_name for _full, param_name in self._block_key_map[idx]]
 
-    def bind(self, block: nn.Module, idx: int, evict_previous: int | None = None) -> None:
+    def bind(
+        self,
+        block: nn.Module,
+        idx: int,
+        evict_previous: int | None = None,
+        lora_sources: list[BlockLoraSource] | None = None,
+    ) -> None:
         """Load block ``idx``'s weights into ``block`` in-place.
 
         Internally calls :func:`mlx.nn.Module.load_weights`. After this
@@ -143,7 +227,44 @@ class BlockStreamer:
         if sample_key not in self._weights:
             self._weights = self._reload_dict()
         weights = [(param_name, self._weights[full_key]) for full_key, param_name in self._block_key_map[idx]]
+
+        if lora_sources:
+            weights = self._fuse_lora_into_block(weights, idx, lora_sources)
+
         block.load_weights(weights, strict=True)
+
+    @staticmethod
+    def _fuse_lora_into_block(
+        weights: list[tuple[str, mx.array]],
+        idx: int,
+        lora_sources: list[BlockLoraSource],
+    ) -> list[tuple[str, mx.array]]:
+        """Apply each source's LoRA delta to the block's weights.
+
+        Reuses :func:`ltx_core_mlx.loader.fuse_loras.apply_loras`, which
+        is already quantization-aware (dequantize → fuse → re-quantize
+        for q8 / q4 layers). Builds a per-block ``StateDict`` that
+        contains only this block's parameters and feeds it through.
+        """
+        # Lazy-import to avoid loader↔block_streaming cycles at module load.
+        from ltx_core_mlx.loader.fuse_loras import apply_loras
+        from ltx_core_mlx.loader.primitives import LoraStateDictWithStrength, StateDict
+
+        block_sd_dict: dict[str, mx.array] = dict(weights)
+        block_sd = StateDict(sd=block_sd_dict, size=0, dtype=set())
+
+        lora_sd_and_strengths: list[LoraStateDictWithStrength] = []
+        for src in lora_sources:
+            if not src.has_block(idx):
+                continue
+            lsd = StateDict(sd=src.get_block_lora_dict(idx), size=0, dtype=set())
+            lora_sd_and_strengths.append(LoraStateDictWithStrength(lsd, src.strength))
+
+        if not lora_sd_and_strengths:
+            return weights
+
+        fused = apply_loras(block_sd, lora_sd_and_strengths)
+        return list(fused.sd.items())
 
     def _reload_dict(self) -> dict[str, mx.array]:
         """Re-mmap all weight files into a fresh dict."""
@@ -187,7 +308,12 @@ class StreamingLTXModel(nn.Module):
         callers (e.g. ``X0Model``) can read ``self.config`` etc.
     """
 
-    def __init__(self, model: nn.Module, streamer: BlockStreamer) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        streamer: BlockStreamer,
+        lora_sources: list[BlockLoraSource] | None = None,
+    ) -> None:
         super().__init__()
         # Register the inner model as a child so its parameters are
         # visible to nn.Module machinery (load_weights, parameters()).
@@ -210,6 +336,7 @@ class StreamingLTXModel(nn.Module):
         object.__setattr__(self, "_streamer", streamer)
         object.__setattr__(self, "_shared_block", shared)
         object.__setattr__(self, "_compiled_block", compiled)
+        object.__setattr__(self, "_lora_sources", lora_sources or [])
 
     def __call__(self, *args, **kwargs):
         # Inject block_provider unless caller already passed one.
@@ -217,6 +344,7 @@ class StreamingLTXModel(nn.Module):
             streamer = object.__getattribute__(self, "_streamer")
             shared = object.__getattribute__(self, "_shared_block")
             compiled = object.__getattribute__(self, "_compiled_block")
+            lora_sources = object.__getattribute__(self, "_lora_sources")
             prev_idx: list[int | None] = [None]
 
             # mx.compile can only trace functions that take pytrees of
@@ -229,7 +357,12 @@ class StreamingLTXModel(nn.Module):
             use_compiled = kwargs.get("perturbations") is None
 
             def provider(idx: int) -> nn.Module:
-                streamer.bind(shared, idx, evict_previous=prev_idx[0])
+                streamer.bind(
+                    shared,
+                    idx,
+                    evict_previous=prev_idx[0],
+                    lora_sources=lora_sources or None,
+                )
                 prev_idx[0] = idx
                 return compiled if use_compiled else shared
 
