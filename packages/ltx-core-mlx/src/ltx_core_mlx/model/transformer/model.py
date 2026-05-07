@@ -225,6 +225,7 @@ class LTXModel(nn.Module):
         perturbations: BatchedPerturbationConfig | None = None,
         tap: callable | None = None,
         block_stack_override: callable | None = None,
+        block_provider: callable | None = None,
     ) -> tuple[mx.array, mx.array]:
         """Forward pass.
 
@@ -254,6 +255,15 @@ class LTXModel(nn.Module):
                 by TeaCache on skip steps to reconstruct outputs from a
                 cached residual without running the blocks. The model's
                 head still runs.
+            block_provider: Optional callable ``(int) -> nn.Module`` that
+                returns the block to invoke at each iteration. When
+                provided, ``self.transformer_blocks`` is bypassed and
+                the provider is called once per ``block_idx`` to fetch
+                the active block instance. Used by block streaming to
+                bind weights from a memory-mapped safetensors file into
+                a single shared block module, capping resident memory
+                at ~1 block instead of ~num_layers blocks. Mutually
+                exclusive with ``block_stack_override``.
 
         Returns:
             Tuple of (video_velocity, audio_velocity), same shapes as inputs.
@@ -361,7 +371,9 @@ class LTXModel(nn.Module):
         if block_stack_override is not None:
             video_hidden, audio_hidden = block_stack_override(video_hidden, audio_hidden)
         else:
-            for block_idx, block in enumerate(self.transformer_blocks):
+            num_layers = self.config.num_layers if block_provider is not None else len(self.transformer_blocks)
+            for block_idx in range(num_layers):
+                block = block_provider(block_idx) if block_provider is not None else self.transformer_blocks[block_idx]
                 video_hidden, audio_hidden = block(
                     video_hidden=video_hidden,
                     audio_hidden=audio_hidden,
