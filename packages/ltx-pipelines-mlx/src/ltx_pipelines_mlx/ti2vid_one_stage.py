@@ -391,6 +391,12 @@ class TextToVideoPipeline:
 
         # Extract ALL 49 layer hidden states with attention mask
         all_hidden_states, attention_mask = self.text_encoder.encode_all_layers(prompt)
+        # Materialize Gemma outputs and flush before the connector forward.
+        # Splits the Metal command buffer so Gemma + connector don't pile
+        # into a single dispatch that exceeds the macOS watchdog under
+        # post-boot indexer contention.
+        mx.eval(all_hidden_states[-1])
+        mx.synchronize()
         video_embeds, audio_embeds = self.feature_extractor(all_hidden_states, attention_mask=attention_mask)
         return video_embeds, audio_embeds
 

@@ -153,6 +153,11 @@ class GemmaLanguageModel(nn.Module):
             all_hidden_states.append(h)
             if (i + 1) % eval_every == 0:
                 mx.eval(h)
+                # Force GPU completion between layers so the Metal command
+                # buffer flushes; otherwise the 48-layer forward can land in
+                # a single dispatch and exceed the macOS watchdog under
+                # post-boot indexer contention.
+                mx.synchronize()
 
         return all_hidden_states
 
