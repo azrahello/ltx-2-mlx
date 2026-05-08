@@ -352,6 +352,7 @@ Entry point: `uv run ltx-2-mlx <command>`. Available commands:
 | `a2v` | Audio-to-video | Two-stage audio-conditioned generation (`--hq` for res_2s) |
 | `keyframe` | Keyframe interpolation | Two-stage interpolation between start/end frames |
 | `ic-lora` | IC-LoRA | Two-stage generation with control video conditioning (depth, canny, pose, motion tracks) |
+| `hdr-ic-lora` | HDR IC-LoRA | Two-stage HDR generation via IC-LoRA + LogC3 inverse (saves SDR mp4 + linear-HDR `.npz`) |
 | `retake` | Retake | Regenerate a time segment of an existing video (dev model + CFG) |
 | `extend` | Extend | Add frames before or after an existing video (dev model + CFG) |
 | `enhance` | Prompt enhancement | Enhance a text prompt using Gemma (no video generation) |
@@ -399,6 +400,25 @@ ltx-2-mlx ic-lora \
 ```
 
 Flags: `--lora PATH STRENGTH` (repeatable, supports HF repo IDs), `--video-conditioning PATH STRENGTH` (repeatable), `--conditioning-strength`, `--skip-stage-2`, `--image`.
+
+### HDR IC-LoRA Example
+
+```bash
+# V2V HDR — upgrade an existing SDR video to linear HDR
+ltx-2-mlx hdr-ic-lora \
+  --prompt "cinematic golden hour" \
+  --lora Lightricks/LTX-2.3-22b-IC-LoRA-HDR 1.0 \
+  --video-conditioning source_sdr.mp4 1.0 \
+  --low-ram -o out.mp4
+
+# T2V HDR — pure text-to-video with HDR output (no conditioning)
+ltx-2-mlx hdr-ic-lora \
+  --prompt "a sunset over the ocean, vivid HDR" \
+  --lora Lightricks/LTX-2.3-22b-IC-LoRA-HDR 1.0 \
+  --low-ram -o out.mp4
+```
+
+Outputs both `out.mp4` (SDR preview, tonemapped) and `out.hdr.npz` (float32 `(F, H, W, 3)` linear HDR tensor for EXR/TIFF conversion). Auto-detects the LoRA's HDR transform (`logc3`) and `reference_downscale_factor` from safetensors metadata. Flags identical to `ic-lora`, with `--video-conditioning` made optional (matches upstream's empty-list path → pure T2V HDR mode).
 
 ### Two-Stage Example
 
@@ -775,6 +795,88 @@ Validation: with conservative config (``--tile-frames 2 --tile-overlap 4`` on 48
 - `model/transformer/modality.py` — `Modality` dataclass (isomorphic with upstream).
 - `model/video_vae/tiling.py` — token-grid primitives (`split_by_count`, `identity_mapping_operation`, `TileCountConfig`).
 - `tests/test_modality_tiling.py` — 8 unit tests bit-exact at 1e-6 (tile/blend round-trips, position normalization, cond overlap, wrapper baseline).
+
+---
+
+## HDR IC-LoRA Pipeline
+
+Two-stage IC-LoRA pipeline that produces **linear HDR video output** via LogC3 inverse compression. Subclasses `ICLoraPipeline` so it inherits low-RAM streaming, modality tiling, bind-time LoRA fusion, and the standard two-stage decode flow. Mirrors upstream `ltx_pipelines.hdr_ic_lora.HDRICLoraPipeline` 1:1 for clean PR diff tracking.
+
+### Mechanism
+
+The HDR LoRA is trained so the VAE decoder output (mapped to `[0, 1]`) holds a LogC3-compressed signal. `LogC3.decompress` recovers the linear HDR signal in `[0, ∞)`. Conditioning input is treated as standard SDR (clamp `[0, 1]` then `to_vae_range`).
+
+| Mode | Support | Notes |
+|---|---|---|
+| **V2V** (SDR ref → HDR) | ✅ primary | `--video-conditioning source.mp4 1.0` |
+| **T2V** (pure text → HDR) | ✅ | `--video-conditioning` omitted (matches upstream's empty-list path); LoRA runs out-of-distribution but functional |
+| **I2V + V2V** | ✅ | Add `--image photo.jpg` on top |
+| **One-stage HDR** | ❌ | Upstream is two-stage by design (stage 1 half-res + stage 2 upscale) — not provided |
+| `high_quality_hdr` mode | ⏳ deferred | Upstream's 2× frame oversample + drop-alternate; not yet ported |
+| EXR sequence output | ⏳ deferred | We save `.hdr.npz` (`(F, H, W, 3)` fp32); user tooling converts to EXR/TIFF |
+
+### Auto-detection
+
+`HdrLoraConfig` is read from the LoRA's safetensors metadata via `read_hdr_lora_config()`:
+
+| Metadata key | Effect |
+|---|---|
+| `hdr_transform` | Names the transform (only `"logc3"` supported); presence triggers HDR mode |
+| `use_hdr_transform` | Legacy boolean fallback |
+| `reference_downscale_factor` | Spatial downscale for V2V conditioning (matches LoRA training recipe) |
+
+`HDRICLoraPipeline.__init__` raises `ValueError` if no HDR LoRA is detected. Pass `hdr_lora_config=HdrLoraConfig(...)` explicitly to override.
+
+### Outputs
+
+- `<output>` (e.g. `out.mp4`): SDR preview, tonemapped via standard streaming VAE decode (clips highlights at 1.0).
+- `<output>.hdr.npz`: float32 `(F, H, W, 3)` linear HDR tensor. User tooling converts to EXR / TIFF / OpenEXR sequences.
+
+### Validated
+
+End-to-end run on M2 Pro 32 GB, dev model + HDR LoRA fused, q8:
+- 480×704×9 short test: 83 s — `pixels > 1.0`: 0.65%, range `[-0.017, 7.85]`.
+- 704×448×89 cosmic with `--low-ram`: 6:43 — 12.84% highlights, range `[-0.017, 55.08]`.
+- 1280×704×97 Lisbon T2V with `--low-ram`: 15:28 — 14.74% highlights, range `[-0.017, 55.08]`.
+
+### Key Files
+
+- `packages/ltx-pipelines-mlx/src/ltx_pipelines_mlx/hdr_ic_lora.py` — `HDRICLoraPipeline` subclass with `_decode_to_hdr` + `generate_and_save` saving HDR npz.
+- `packages/ltx-core-mlx/src/ltx_core_mlx/hdr.py` — `LogC3` compress/decompress + `apply_hdr_decode_postprocess`.
+- `packages/ltx-core-mlx/src/ltx_core_mlx/loader/hdr_metadata.py` — `HdrLoraConfig` + `read_hdr_lora_config`.
+- `tests/test_hdr.py`, `tests/test_hdr_metadata.py` — 16 unit tests.
+
+---
+
+## Metal Watchdog Guard (`LTX2_METAL_WATCHDOG_GUARD`)
+
+Optional opt-in flag to defend against macOS' `kIOGPUCommandBufferCallbackErrorImpactingInteractivity` watchdog (~10 s per Metal command buffer). When set to `1`, helpers in `ltx_core_mlx.utils.metal_watchdog.flush()` insert `mx.eval` + `mx.synchronize` between heavy ops:
+
+- Per Gemma transformer layer (48 layers × ~200 ms each can otherwise cluster).
+- Per `Embeddings1DConnector` block (8 video + 8 audio at seq_len 1024).
+- Between feature-extractor stages (text projection → video connector → audio connector).
+- Between Gemma output and the connector forward in `_encode_text`.
+
+**Default: off.** Forced sync limits GPU pipelining on capable hardware (M2/M3 Ultra, Mac Studio with abundant headroom). Enable only when you actually see the watchdog error:
+
+```bash
+LTX2_METAL_WATCHDOG_GUARD=1 ltx-2-mlx generate ...
+```
+
+Most often triggered post-boot when Spotlight, Siri, and Biome indexers are competing for GPU. Once those finish (~30–60 min), the guard is usually unnecessary.
+
+### Companion: `LTX2_GEMMA_MAX_LENGTH`
+
+Caps the padded Gemma sequence length (default `1024`). Reducing to `512` or `256` halves/quarters the Gemma forward time but **shifts left-padded RoPE positions away from the LTX training distribution** — quality risk. Use only when even the watchdog guard isn't enough headroom.
+
+```bash
+# Extreme-contention escape hatch
+LTX2_METAL_WATCHDOG_GUARD=1 LTX2_GEMMA_MAX_LENGTH=512 ltx-2-mlx hdr-ic-lora ...
+```
+
+### Key File
+
+- `packages/ltx-core-mlx/src/ltx_core_mlx/utils/metal_watchdog.py` — single `flush(*arrays)` helper, env-var gated.
 
 ---
 

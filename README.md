@@ -10,6 +10,7 @@ Pure MLX port of [LTX-2](https://github.com/Lightricks/LTX-2) for Apple Silicon.
 - **Retake / Extend** — edit existing videos (regenerate segments, add frames)
 - **Keyframe interpolation** — smooth transition between reference images
 - **IC-LoRA** — reference video conditioning (depth/pose/edges)
+- **HDR IC-LoRA** — LogC3-compressed HDR generation (V2V upgrade or pure T2V) producing linear HDR `.npz` + SDR mp4 preview
 - **Two-stage generation** — half-res → neural upscale → refine
 - **HQ generation** — res_2s second-order sampler + CFG/STG guidance
 - **Prompt enhancement** — Gemma 3 12B rewrites short prompts into detailed descriptions
@@ -81,6 +82,15 @@ ltx-2-mlx generate -p "A cat" -o cat.mp4 --hq --low-ram
 ltx-2-mlx a2v -p "music video" --audio music.wav -o a2v.mp4 --low-ram
 ltx-2-mlx keyframe -p "transition" --start a.png --end b.png -o kf.mp4 --low-ram
 ltx-2-mlx ic-lora -p "scene" --lora lora.safetensors 1.0 --video-conditioning depth.mp4 1.0 --low-ram -o out.mp4
+
+# HDR IC-LoRA — V2V upgrade an SDR video to linear HDR (saves out.mp4 + out.hdr.npz)
+ltx-2-mlx hdr-ic-lora -p "cinematic golden hour" \
+    --lora Lightricks/LTX-2.3-22b-IC-LoRA-HDR 1.0 \
+    --video-conditioning source_sdr.mp4 1.0 --low-ram -o out.mp4
+
+# HDR IC-LoRA — pure T2V (no conditioning video)
+ltx-2-mlx hdr-ic-lora -p "a sunset over the ocean, vivid HDR" \
+    --lora Lightricks/LTX-2.3-22b-IC-LoRA-HDR 1.0 --low-ram -o out.mp4
 
 # Modality tiling: split video tokens for long/HD scenarios that exceed attention memory.
 # Stack with --low-ram for max memory savings on big targets.
@@ -218,11 +228,26 @@ ltx-2-mlx keyframe   Keyframe interpolation (two-stage, dev model + CFG)
   --stage1-steps      Stage 1 steps (default: 30)
   --stage2-steps      Stage 2 steps (default: 3)
 
+ltx-2-mlx hdr-ic-lora HDR IC-LoRA (two-stage, LogC3 → linear HDR)
+  --lora PATH STRENGTH       HDR LoRA (e.g. Lightricks/LTX-2.3-22b-IC-LoRA-HDR), repeatable
+  --video-conditioning P S   Optional SDR ref video for V2V upgrade (omit for pure T2V)
+  --image, -i                Optional I2V reference image
+  --stage1-steps             Stage 1 steps (default: 8)
+  --stage2-steps             Stage 2 steps (default: 3)
+  --conditioning-strength    IC-LoRA attention strength (default: 1.0)
+  --skip-stage-2             Skip upscale stage (half-res HDR output)
+                  → saves <output>.mp4 + <output>.hdr.npz (fp32 (F,H,W,3) linear HDR)
+
 ltx-2-mlx enhance    Prompt enhancement (no generation)
   --mode              "t2v" or "i2v" (default: t2v)
 
 ltx-2-mlx info       Model info and memory estimate
 ```
+
+### Environment variables
+
+- `LTX2_METAL_WATCHDOG_GUARD=1` — opt-in flush + GPU sync between Gemma layers / connector blocks. Defends against macOS' Impacting Interactivity watchdog (~10 s) when the system is under heavy GPU contention (Spotlight/Siri post-boot indexing). Default off — leaves full pipelining on capable hardware.
+- `LTX2_GEMMA_MAX_LENGTH=N` — cap padded Gemma sequence length (default 1024). Reducing to 512/256 speeds Gemma forward proportionally but **shifts left-padded RoPE positions** away from the LTX training distribution (quality risk). Use only if the watchdog guard alone isn't enough.
 
 ## Frame Count Reference
 
