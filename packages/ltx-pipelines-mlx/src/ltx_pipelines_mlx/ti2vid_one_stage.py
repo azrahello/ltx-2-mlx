@@ -224,7 +224,7 @@ class TI2VidOneStagePipeline(TwoStagePipeline):
         # We can free the VAE encoder before the heavy denoise loop;
         # decoders are loaded on-demand in generate_and_save.
         if self.low_memory and image is None:
-            self.vae_encoder = None
+            self.image_conditioner.free()
             aggressive_cleanup()
 
         output = guided_denoise_loop(
@@ -285,9 +285,8 @@ class TI2VidOneStagePipeline(TwoStagePipeline):
         # Free generation components to make room for decoders
         if self.low_memory:
             self.dit = None
-            self.text_encoder = None
-            self.feature_extractor = None
-            self.vae_encoder = None
+            self.prompt_encoder.free()
+            self.image_conditioner.free()
             self._loaded = False
             aggressive_cleanup()
 

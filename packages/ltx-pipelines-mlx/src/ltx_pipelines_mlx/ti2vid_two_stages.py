@@ -485,7 +485,7 @@ class TwoStagePipeline(BasePipeline):
 
         # Free VAE encoder + upsampler before Stage 2 denoising
         if self.low_memory:
-            self.vae_encoder = None
+            self.image_conditioner.free()
             self.upsampler = None
             aggressive_cleanup()
 
@@ -590,9 +590,8 @@ class TwoStagePipeline(BasePipeline):
         # Free transformer + encoder to make room for decoders
         if self.low_memory:
             self.dit = None
-            self.text_encoder = None
-            self.feature_extractor = None
-            self.vae_encoder = None
+            self.prompt_encoder.free()
+            self.image_conditioner.free()
             self.upsampler = None
             self._loaded = False
             aggressive_cleanup()

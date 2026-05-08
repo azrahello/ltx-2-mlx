@@ -378,8 +378,7 @@ class ICLoraPipeline(BasePipeline):
         # NOTE: mx.eval is MLX graph evaluation, NOT Python eval()
         mx.eval(video_embeds, audio_embeds)
         if self.low_memory:
-            self.text_encoder = None
-            self.feature_extractor = None
+            self.prompt_encoder.free()
             aggressive_cleanup()
 
         # Load DiT + VAE encoder + upsampler (no decoders)
@@ -502,7 +501,7 @@ class ICLoraPipeline(BasePipeline):
 
         # Free VAE encoder + upsampler + fused DiT before loading clean transformer
         if self.low_memory:
-            self.vae_encoder = None
+            self.image_conditioner.free()
             self.upsampler = None
         # Reload clean transformer without LoRA (matches reference: separate model ledgers)
         self._reload_clean_transformer()
@@ -608,10 +607,9 @@ class ICLoraPipeline(BasePipeline):
         # Free generation components to make room for decoders
         if self.low_memory:
             self.dit = None
-            self.text_encoder = None
-            self.feature_extractor = None
+            self.prompt_encoder.free()
             self.upsampler = None
-            self.vae_encoder = None
+            self.image_conditioner.free()
             self._loaded = False
             aggressive_cleanup()
 

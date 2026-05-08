@@ -148,24 +148,16 @@ class KeyframeInterpolationPipeline(TwoStagePipeline):
         H_up, W_up = H_half * 2, W_half * 2
         up_h, up_w = H_up * 32, W_up * 32
 
-        # --- Encode keyframes at both resolutions ---
-        self._load_vae_encoder()
-        assert self.vae_encoder is not None
+        # --- Encode keyframes at both resolutions via ImageConditioner block ---
+        _materialize = getattr(mx, "eval")  # noqa: B009
 
-        kf_tokens_half = []
-        for img in keyframe_images:
-            tokens = _encode_keyframe(self.vae_encoder, img, enc_h_half, enc_w_half)
-            kf_tokens_half.append(tokens)
+        def _encode_all_keyframes(encoder) -> tuple[list, list]:
+            half = [_encode_keyframe(encoder, img, enc_h_half, enc_w_half) for img in keyframe_images]
+            full = [_encode_keyframe(encoder, img, up_h, up_w) for img in keyframe_images]
+            _materialize(*(half + full))  # materialize before encoder is freed
+            return half, full
 
-        kf_tokens_full = []
-        for img in keyframe_images:
-            tokens = _encode_keyframe(self.vae_encoder, img, up_h, up_w)
-            kf_tokens_full.append(tokens)
-
-        # Force evaluation before freeing encoder — ensures all Metal
-        # operations using the encoder weights are complete
-        mx.eval(*(kf_tokens_half + kf_tokens_full))
-        self.vae_encoder = None
+        kf_tokens_half, kf_tokens_full = self.image_conditioner(_encode_all_keyframes, free_after=True)
         aggressive_cleanup()
 
         # --- Text encoding (load Gemma, encode, free) ---
@@ -179,8 +171,7 @@ class KeyframeInterpolationPipeline(TwoStagePipeline):
             neg_audio_embeds = None
             mx.eval(video_embeds, audio_embeds)
             # Free text encoder before loading transformer
-            self.text_encoder = None
-            self.feature_extractor = None
+            self.prompt_encoder.free()
             aggressive_cleanup()
 
         # --- Load transformer (dev model required) + upsampler only ---
@@ -309,19 +300,17 @@ class KeyframeInterpolationPipeline(TwoStagePipeline):
         # Without this, the upsampler produces grid/weave artifacts.
         video_half = self.video_patchifier.unpatchify(gen_tokens_1, (F, H_half, W_half))
 
-        # Load encoder stats for normalization (encoder itself was already freed)
-        # unpatchify returns PyTorch layout (B, C, F, H, W), encoder stats expect MLX (B, F, H, W, C)
-        self._load_vae_encoder()
-        assert self.vae_encoder is not None
-        video_mlx = video_half.transpose(0, 2, 3, 4, 1)  # (B,C,F,H,W) -> (B,F,H,W,C)
-        video_denorm = self.vae_encoder.denormalize_latent(video_mlx)
-        video_denorm = video_denorm.transpose(0, 4, 1, 2, 3)  # back to (B,C,F,H,W)
-        video_upscaled = self.upsampler(video_denorm)
-        video_up_mlx = video_upscaled.transpose(0, 2, 3, 4, 1)  # (B,C,F,H,W) -> (B,F,H,W,C)
-        video_up_mlx = self.vae_encoder.normalize_latent(video_up_mlx)
-        video_upscaled = video_up_mlx.transpose(0, 4, 1, 2, 3)  # back to (B,C,F,H,W)
+        # Reload encoder for normalization stats (encoder was freed earlier).
+        # unpatchify returns PyTorch layout (B, C, F, H, W); stats expect MLX (B, F, H, W, C).
+        def _denorm_upscale_renorm(encoder) -> mx.array:
+            v_mlx = video_half.transpose(0, 2, 3, 4, 1)  # (B,C,F,H,W) -> (B,F,H,W,C)
+            v_denorm = encoder.denormalize_latent(v_mlx).transpose(0, 4, 1, 2, 3)
+            v_up = self.upsampler(v_denorm)
+            v_up_mlx = encoder.normalize_latent(v_up.transpose(0, 2, 3, 4, 1))
+            return v_up_mlx.transpose(0, 4, 1, 2, 3)
+
+        video_upscaled = self.image_conditioner(_denorm_upscale_renorm, free_after=True)
         mx.async_eval(video_upscaled)
-        self.vae_encoder = None
         if self.low_memory:
             self.upsampler = None
             aggressive_cleanup()
@@ -458,8 +447,7 @@ class KeyframeInterpolationPipeline(TwoStagePipeline):
         # Free any remaining heavy components from generation phase
         if self.low_memory:
             self.dit = None
-            self.text_encoder = None
-            self.feature_extractor = None
+            self.prompt_encoder.free()
             self.upsampler = None
             self._loaded = False
             aggressive_cleanup()

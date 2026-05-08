@@ -137,8 +137,7 @@ class DistilledPipeline(TwoStagePipeline):
         video_embeds, audio_embeds = self._encode_text(prompt)
         _materialize(video_embeds, audio_embeds)
         if self.low_memory:
-            self.text_encoder = None
-            self.feature_extractor = None
+            self.prompt_encoder.free()
             aggressive_cleanup()
 
         # --- Load distilled DiT + VAE encoder + upsampler ---
@@ -249,7 +248,7 @@ class DistilledPipeline(TwoStagePipeline):
             )
 
         if self.low_memory:
-            self.vae_encoder = None
+            self.image_conditioner.free()
             self.upsampler = None
             aggressive_cleanup()
 

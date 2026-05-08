@@ -258,7 +258,7 @@ class TwoStageHQPipeline(TwoStagePipeline):
             )
 
         if self.low_memory:
-            self.vae_encoder = None
+            self.image_conditioner.free()
             self.upsampler = None
             aggressive_cleanup()
 

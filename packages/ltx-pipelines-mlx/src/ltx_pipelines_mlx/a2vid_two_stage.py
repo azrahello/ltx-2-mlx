@@ -191,18 +191,21 @@ class AudioToVideoPipeline(TwoStagePipeline):
         video_positions_1 = compute_video_positions(F, H_half, W_half)
         audio_positions = compute_audio_positions(audio_T)
 
-        # I2V conditioning at half resolution (load VAE encoder on-demand, then free)
+        # I2V conditioning at half resolution via ImageConditioner block
         conditionings_1: list[VideoConditionByLatentIndex] = []
         if image is not None:
-            self._load_vae_encoder()
-            assert self.vae_encoder is not None
             enc_h_half = H_half * 32
             enc_w_half = W_half * 32
             img_tensor = prepare_image_for_encoding(image, enc_h_half, enc_w_half)
             img_tensor = img_tensor[:, :, None, :, :]
-            ref_latent = self.vae_encoder.encode(img_tensor)
-            ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
-            mx.synchronize()
+
+            def _encode_ref(encoder) -> mx.array:
+                latent = encoder.encode(img_tensor)
+                tokens = latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
+                mx.synchronize()
+                return tokens
+
+            ref_tokens = self.image_conditioner(_encode_ref, free_after=self.low_memory)
             conditionings_1.append(
                 VideoConditionByLatentIndex(
                     frame_indices=[0],
@@ -210,9 +213,7 @@ class AudioToVideoPipeline(TwoStagePipeline):
                     strength=1.0,
                 )
             )
-            # Free VAE encoder before Stage 1 denoising to save memory
             if self.low_memory:
-                self.vae_encoder = None
                 aggressive_cleanup()
 
         # Stage 1 video: legacy_scalar_blend=True for bit-exact match with the
@@ -259,49 +260,35 @@ class AudioToVideoPipeline(TwoStagePipeline):
         # --- Fuse distilled LoRA for Stage 2 ---
         self._fuse_distilled_lora(self.dit)
 
-        # --- Load VAE encoder + upsampler for upscale (deferred from before Stage 1) ---
-        self._load_vae_encoder()
+        # --- Upscale + (optional) full-res I2V conditioning via ImageConditioner block ---
         if self.upsampler is None:
             self._load_upsampler()
-        assert self.vae_encoder is not None
         assert self.upsampler is not None
 
-        # --- Upscale with denormalize/renormalize ---
         video_half = self.video_patchifier.unpatchify(output_1.video_latent, (F, H_half, W_half))
-
-        video_mlx = video_half.transpose(0, 2, 3, 4, 1)  # (B,C,F,H,W) -> (B,F,H,W,C)
-        video_denorm = self.vae_encoder.denormalize_latent(video_mlx)
-        video_denorm = video_denorm.transpose(0, 4, 1, 2, 3)
-        video_upscaled = self.upsampler(video_denorm)
-        video_up_mlx = video_upscaled.transpose(0, 2, 3, 4, 1)
-        video_upscaled = self.vae_encoder.normalize_latent(video_up_mlx)
-        video_upscaled = video_upscaled.transpose(0, 4, 1, 2, 3)
-        mx.synchronize()
-
-        # Derive full-resolution dims from actual upscaled shape
         H_full = H_half * 2
         W_full = W_half * 2
 
-        # I2V conditioning at full resolution for Stage 2
-        conditionings_2: list[VideoConditionByLatentIndex] = []
-        if image is not None:
-            enc_h_full = H_full * 32
-            enc_w_full = W_full * 32
-            img_tensor = prepare_image_for_encoding(image, enc_h_full, enc_w_full)
-            img_tensor = img_tensor[:, :, None, :, :]
-            ref_latent = self.vae_encoder.encode(img_tensor)
-            ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
-            conditionings_2.append(
-                VideoConditionByLatentIndex(
-                    frame_indices=[0],
-                    clean_latent=ref_tokens,
-                    strength=1.0,
-                )
-            )
+        def _upscale_and_optionally_encode(encoder) -> tuple[mx.array, list[VideoConditionByLatentIndex]]:
+            v_mlx = video_half.transpose(0, 2, 3, 4, 1)
+            v_denorm = encoder.denormalize_latent(v_mlx).transpose(0, 4, 1, 2, 3)
+            v_up = self.upsampler(v_denorm)
+            v_up_renorm = encoder.normalize_latent(v_up.transpose(0, 2, 3, 4, 1)).transpose(0, 4, 1, 2, 3)
+            mx.synchronize()
+            conds: list[VideoConditionByLatentIndex] = []
+            if image is not None:
+                enc_h_full = H_full * 32
+                enc_w_full = W_full * 32
+                img_t = prepare_image_for_encoding(image, enc_h_full, enc_w_full)[:, :, None, :, :]
+                ref_latent = encoder.encode(img_t)
+                ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
+                conds.append(VideoConditionByLatentIndex(frame_indices=[0], clean_latent=ref_tokens, strength=1.0))
+            return v_up_renorm, conds
 
-        # Free VAE encoder + upsampler before Stage 2
+        video_upscaled, conditionings_2 = self.image_conditioner(
+            _upscale_and_optionally_encode, free_after=self.low_memory
+        )
         if self.low_memory:
-            self.vae_encoder = None
             self.upsampler = None
             aggressive_cleanup()
 

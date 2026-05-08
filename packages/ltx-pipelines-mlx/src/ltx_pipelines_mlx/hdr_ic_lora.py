@@ -166,10 +166,9 @@ class HDRICLoraPipeline(ICLoraPipeline):
 
         if self.low_memory:
             self.dit = None
-            self.text_encoder = None
-            self.feature_extractor = None
+            self.prompt_encoder.free()
+            self.image_conditioner.free()
             self.upsampler = None
-            self.vae_encoder = None
             self._loaded = False
             aggressive_cleanup()
 
