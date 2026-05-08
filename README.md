@@ -15,6 +15,7 @@ Pure MLX port of [LTX-2](https://github.com/Lightricks/LTX-2) for Apple Silicon.
 - **Prompt enhancement** — Gemma 3 12B rewrites short prompts into detailed descriptions
 - **Training** — LoRA fine-tuning with flow matching (T2V and V2V strategies)
 - **Block streaming (`--low-ram`)** — stream transformer blocks from disk so q8 fits 16 GB Macs and bf16 fits 32 GB Macs (covers generate / `--two-stage` / `--hq` / a2v / keyframe / ic-lora; bind-time LoRA fusion supports custom distilled-lora-strength)
+- **Modality tiling (`--tile-frames N --tile-spatial M`)** — split video tokens into spatial+temporal tiles to cap O(N²) attention activations. Combined with `--low-ram`, unblocks long / HD / 4K generations on Mac Studio (64-128 GB) that would otherwise OOM.
 - **3 model variants** — bf16, int8, int4 (fits 16GB–64GB Macs)
 - **3 upsamplers** — spatial 2x, spatial 1.5x, temporal 2x
 
@@ -80,6 +81,13 @@ ltx-2-mlx generate -p "A cat" -o cat.mp4 --hq --low-ram
 ltx-2-mlx a2v -p "music video" --audio music.wav -o a2v.mp4 --low-ram
 ltx-2-mlx keyframe -p "transition" --start a.png --end b.png -o kf.mp4 --low-ram
 ltx-2-mlx ic-lora -p "scene" --lora lora.safetensors 1.0 --video-conditioning depth.mp4 1.0 --low-ram -o out.mp4
+
+# Modality tiling: split video tokens for long/HD scenarios that exceed attention memory.
+# Stack with --low-ram for max memory savings on big targets.
+ltx-2-mlx generate -p "long scene" --two-stage --low-ram \
+    --tile-frames 2 --tile-overlap 4 -o long.mp4
+ltx-2-mlx generate -p "1080p scene" --hq --low-ram \
+    --tile-spatial 2 --tile-overlap 4 -H 1080 -W 1920 -o hd.mp4
 
 # Model info
 ltx-2-mlx info --model dgrauet/ltx-2.3-mlx-q8

@@ -176,8 +176,8 @@ Weights are pre-converted by [mlx-forge](https://github.com/dgrauet/mlx-forge) a
 
 | Variant | HuggingFace | Size | Notes |
 |---------|-------------|------|-------|
-| bf16 | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | ~42GB | Full precision, fits 32GB with `--low-ram`, 64GB+ otherwise |
-| int8 | [dgrauet/ltx-2.3-mlx-q8](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) | ~26GB | Recommended for 32GB+; fits 16GB with `--low-ram` |
+| bf16 | [dgrauet/ltx-2.3-mlx](https://huggingface.co/dgrauet/ltx-2.3-mlx) | ~42GB | Full precision, fits 32GB with `--low-ram`, 64GB+ otherwise. For >4s HD or 1080p: stack with `--tile-spatial 2`. |
+| int8 | [dgrauet/ltx-2.3-mlx-q8](https://huggingface.co/dgrauet/ltx-2.3-mlx-q8) | ~26GB | Recommended for 32GB+; fits 16GB with `--low-ram`. Stack with tiling for HD on Mac Studio. |
 | int4 | [dgrauet/ltx-2.3-mlx-q4](https://huggingface.co/dgrauet/ltx-2.3-mlx-q4) | ~12GB | Lower quality, fits 16GB |
 
 ### MLX Layout Conventions
@@ -714,7 +714,67 @@ For `ic-lora`, each control LoRA is attached as a ``BlockLoraSource`` to the str
 - `loader/block_streaming.py` — `BlockStreamer` (mmap'd safetensors + per-block key map + bind with eviction + auto-reload) and `StreamingLTXModel` (drop-in wrapper).
 - `model/transformer/model.py` — `block_provider` parameter on `LTXModel.__call__` + per-block sync.
 - `ti2vid_one_stage.py` — pipeline integration: `low_ram_streaming` constructor flag wired to `--low-ram` CLI.
-- `tests/test_block_streaming.py` — 6 unit tests covering bind, block_provider hook, wrapper, eviction + auto-reload.
+- `tests/test_block_streaming.py` — 7 unit tests covering bind, block_provider hook, wrapper, eviction + auto-reload, bind-time LoRA fusion.
+
+---
+
+## Modality Tiling (`--tile-frames N --tile-spatial M`)
+
+Splits the patchified video token sequence into spatial+temporal tiles so each tile is denoised independently, then blends results back with trapezoidal weights. Tackles a different memory bottleneck than block streaming:
+
+- **Block streaming**: caps **weight memory** (transformer params).
+- **Modality tiling**: caps **activation memory during forward**, dominated by the O(N²) attention scores tensor.
+
+For long / HD videos, attention activations can exceed working-set even with weights streamed. Tiling splits N into N/k per tile so peak attention memory drops by ``k²``.
+
+### Why on Apple Silicon
+
+Per-layer attention scores tensor size scales with token count squared:
+
+- 480x704x33 (Nv=1650): ~350 MB / layer.
+- 480x704x97 (Nv=3168): ~1.3 GB / layer.
+- 720x1280x97 (Nv≈9000): ~10 GB / layer.
+- 1080p 8s+: doesn't fit any current Apple Silicon.
+
+For the latter targets, ``--tile-spatial 2`` (4 spatial tiles) cuts attention activation by 4x. Combined with ``--low-ram`` (weights ~3 GB), 1080p / 8s+ inference becomes feasible on Mac Studio 64-128 GB.
+
+### Architecture
+
+Mirrors upstream ``ltx_core.modality_tiling.VideoModalityTilingHelper`` API verbatim:
+
+- ``Modality`` dataclass (``model/transformer/modality.py``): bundles latent + sigma + timesteps + positions + context + masks. The canonical input/output type for tiling helpers.
+- ``VideoModalityTiler.tile_modality(modality, tile, normalize_positions=True) -> (Modality, TileContext)``: slices token-level state to a tile, normalizes positions, builds keep mask + per-cond-token blend weights.
+- ``VideoModalityTiler.blend(tile_output, tile, ctx, output=None)`` accumulates the tile contribution into the full token buffer with trapezoidal blend masks at overlaps.
+- ``TiledLTXModel`` wraps ``LTXModel`` (or ``StreamingLTXModel``); intercepts ``__call__``, builds Modality from kwargs, iterates tiles, blends video output, averages audio output across tiles. Pipelines stay unchanged.
+
+### Position layout divergence (documented)
+
+Upstream uses ``(B, num_axes, T, 2)`` interval positions per token; we use ``(B, T, num_axes)`` point coords (consistent with the rest of our codebase). Conditioning-token overlap test is therefore "point in [tile_start, tile_end] on every axis" instead of upstream's interval-overlap. Mathematically equivalent for non-degenerate intervals.
+
+### CLI
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--tile-frames N` | 1 | Number of temporal tiles |
+| `--tile-spatial M` | 1 | Number of spatial tiles per axis (M*M total) |
+| `--tile-overlap K` | 2 | Token-grid overlap between tiles. Larger overlap = smoother blend but more redundant compute |
+
+Total tiles = ``N * M * M``. Default ``1*1*1`` = no tiling.
+
+Coverage: ``generate`` (one-stage / ``--two-stage`` / ``--hq``), ``a2v``, ``keyframe`` via ``TwoStagePipeline.tile_count`` (inherited). ``ic-lora`` could be wired on the same model with the same primitive but isn't yet.
+
+### Tradeoff
+
+Tiling adds wall-clock overhead (each tile is a separate model forward + kernel dispatch). On 32 GB Mac at typical Nv (1650-3168), tiling overhead dominates over memory benefit — use ``--low-ram`` alone. On Mac Studio 64-128 GB targeting 1080p / 8s+ where attention activations OOM otherwise, tiling unblocks the run at the cost of ~2-3x latency.
+
+Validation: with conservative config (``--tile-frames 2 --tile-overlap 4`` on 480x704x33), output is **PSNR 228 dB / bit-identical** to non-tiled baseline (overlap saturates the tile coverage, blend math averages back to identity). Confirms blend correctness; not a stress test of tile boundaries.
+
+### Key Files
+
+- `components/modality_tiling.py` — `VideoModalityTiler` + `TiledLTXModel`.
+- `model/transformer/modality.py` — `Modality` dataclass (isomorphic with upstream).
+- `model/video_vae/tiling.py` — token-grid primitives (`split_by_count`, `identity_mapping_operation`, `TileCountConfig`).
+- `tests/test_modality_tiling.py` — 8 unit tests bit-exact at 1e-6 (tile/blend round-trips, position normalization, cond overlap, wrapper baseline).
 
 ---
 
