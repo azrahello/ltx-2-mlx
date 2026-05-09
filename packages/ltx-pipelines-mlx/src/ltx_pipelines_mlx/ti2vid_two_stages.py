@@ -252,19 +252,18 @@ class TI2VidTwoStagesPipeline(BasePipeline):
         """Load DiT + VAE encoder + upsampler (skip decoders for memory).
 
         Decoders are loaded on-demand in ``generate_and_save()``.
+
+        Skips reloading the text encoder: ``generate_two_stage`` encodes
+        the prompt and frees Gemma BEFORE calling :meth:`load`. Loading
+        Gemma again here would thrash the Metal heap (7.5 GB load/mmap +
+        free) right before the 10 GB DiT — a documented cause of macOS
+        GPU watchdog crashes under sustained system contention.
         """
         if self._loaded:
             return
 
-        # Text encoder + connector
-        self._load_text_encoder()
-
         # DiT (dev model)
         if self.dit is None:
-            if self.low_memory:
-                self.text_encoder = None
-                aggressive_cleanup()
-
             self.dit = self._load_dev_transformer()
 
         # VAE encoder (for denorm/renorm + optional I2V)

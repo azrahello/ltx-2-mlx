@@ -260,28 +260,23 @@ class BasePipeline:
     # ------------------------------------------------------------------
 
     def load(self) -> None:
-        """Load all model components from disk.
+        """Load DiT + VAE + decoders from disk.
 
-        In low_memory mode, components are loaded in stages to avoid
-        exceeding Metal memory. Gemma (7GB) + connector (6GB) are loaded
-        first for text encoding, then freed before loading the
-        transformer (10.5GB).
+        Subclasses' ``generate_*`` methods own the text encoder
+        lifecycle: they encode the prompt and free Gemma before
+        calling :meth:`load`, so this method intentionally does NOT
+        reload Gemma. Doing so would thrash the Metal heap (7.5 GB
+        load/mmap + free) right before the 10 GB DiT — a documented
+        cause of macOS GPU watchdog crashes under sustained system
+        contention.
         """
         if self._loaded:
             return
 
         model_dir = self.model_dir
 
-        # Stage 1: Text encoder + connector (loaded first, freed after encode)
-        self._load_text_encoder()
-
-        # Stage 2: DiT (largest component — load after text encoding frees Gemma)
+        # Stage 1: DiT (largest component)
         if self.dit is None:
-            if self.low_memory:
-                # Free text encoder before loading transformer to fit in RAM
-                self.text_encoder = None
-                aggressive_cleanup()
-
             transformer_path = model_dir / "transformer.safetensors"
             if not transformer_path.exists():
                 # Fallback: try transformer-distilled.safetensors (mlx-forge dual-variant layout)
@@ -304,7 +299,7 @@ class BasePipeline:
             else:
                 self.dit = self._load_transformer_with_optional_streaming(transformer_path)
 
-        # Stage 3: VAE + audio (smaller components)
+        # Stage 2: VAE + audio (smaller components)
         self._load_decoders()
 
         self._loaded = True

@@ -80,15 +80,19 @@ class DistilledPipeline(TI2VidTwoStagesPipeline):
         )
 
     def load(self) -> None:
-        """Load distilled DiT + VAE encoder + upsampler (skip decoders)."""
+        """Load distilled DiT + VAE encoder + upsampler (skip decoders).
+
+        Skips reloading the text encoder: ``generate_two_stage`` encodes
+        the prompt and frees Gemma BEFORE calling :meth:`load`. Loading
+        Gemma again here would just thrash the Metal heap (7.5 GB
+        load/mmap + free) right before DiT is loaded — a documented
+        cause of macOS GPU watchdog crashes under sustained system
+        contention.
+        """
         if self._loaded:
             return
 
-        self._load_text_encoder()
-
         if self.dit is None:
-            if self.low_memory:
-                self.prompt_encoder.free()
             transformer_path = self.model_dir / "transformer.safetensors"
             if not transformer_path.exists():
                 transformer_path = self.model_dir / "transformer-distilled.safetensors"

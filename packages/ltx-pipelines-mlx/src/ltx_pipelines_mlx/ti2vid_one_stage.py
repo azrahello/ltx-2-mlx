@@ -82,16 +82,18 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
         )
 
     def load(self) -> None:
-        """Load dev DiT + VAE encoder. No upsampler needed (no stage 2)."""
+        """Load dev DiT + VAE encoder. No upsampler needed (no stage 2).
+
+        Skips reloading the text encoder: ``generate_one_stage_dev``
+        encodes the prompt and frees Gemma BEFORE calling :meth:`load`.
+        Loading Gemma again here would just thrash the Metal heap
+        (7.5 GB load/mmap + free) right before DiT — a documented cause
+        of macOS GPU watchdog crashes under sustained system contention.
+        """
         if self._loaded:
             return
 
-        self._load_text_encoder()
-
         if self.dit is None:
-            if self.low_memory:
-                self.text_encoder = None
-                aggressive_cleanup()
             self.dit = self._load_dev_transformer()
 
         # VAE encoder is needed only for I2V (image conditioning).
