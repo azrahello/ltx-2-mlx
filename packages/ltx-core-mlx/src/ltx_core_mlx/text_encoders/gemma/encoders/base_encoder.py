@@ -140,22 +140,15 @@ class GemmaLanguageModel(nn.Module):
         else:
             combined_mask = causal_mask[None, None, :, :]  # (1, 1, T, T)
 
-        # Default: 100% lazy (mirrors ernie-image-mlx and other healthy MLX
-        # ports). Counter-intuitively, forced per-layer mx.eval/synchronize
-        # HURTS under macOS GPU contention: each command buffer queues behind
-        # system processes (mds_stores, knowledgeconstructiond, OS update
-        # staging) and waits for the Metal queue to drain instead of letting
-        # the driver batch kernels efficiently. LTX2_GEMMA_EVAL_EVERY=N opts
-        # back into per-layer eval if you actually need it (debugging, very
-        # large prompts on capable hardware).
         # Per-layer eval is necessary on <=48 GB Macs to keep each Metal
-        # command buffer below the watchdog deadline. The downstream
-        # feature_extractor projection materializes its inputs in one
-        # buffer; without per-layer eval, that buffer pulls all 48
+        # command buffer below the macOS GPU watchdog deadline. The
+        # downstream feature_extractor projection materializes its inputs
+        # in one buffer; without per-layer eval, that buffer pulls all 48
         # Gemma layers into a single dispatch that exceeds the limit
-        # under sustained system contention. No-op on >48 GB devices.
-        # LTX2_GEMMA_EVAL_EVERY=N overrides the default (1 on 32 GB,
-        # 0 on >48 GB).
+        # under sustained system contention (Spotlight, Siri, mds_stores).
+        # No-op on >48 GB devices, which keep full lazy-graph pipelining.
+        # LTX2_GEMMA_EVAL_EVERY=N overrides the auto-default (1 on
+        # <=48 GB, 0 on >48 GB).
         _split_per_layer = mx.device_info()["memory_size"] <= 48 * 1024**3
         eval_every = int(os.environ.get("LTX2_GEMMA_EVAL_EVERY", "1" if _split_per_layer else "0"))
         for i, layer in enumerate(inner.layers):
