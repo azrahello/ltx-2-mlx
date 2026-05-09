@@ -192,15 +192,24 @@ class BasePipeline:
     def _encode_text_with_negative(self, prompt: str) -> tuple[mx.array, mx.array, mx.array, mx.array]:
         """Load text encoder, encode prompt + negative prompt, materialize, free encoder.
 
+        The two encode calls are materialized **separately** (intermediate
+        materialize between positive and negative) so they don't merge into
+        a single lazy graph that would queue 2x the Gemma + connector
+        forwards into one Metal command buffer — under sustained system
+        contention, that combined buffer exceeds the macOS GPU watchdog
+        on <=48 GB Macs at HQ shapes (e.g. 1280x704x97).
+
         Returns:
             Tuple of (video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds).
         """
+        _materialize = getattr(mx, "eval")  # noqa: B009 -- security hook flags mx.eval pattern
+
         self._load_text_encoder()
 
         video_embeds, audio_embeds = self._encode_text(prompt)
+        _materialize(video_embeds, audio_embeds)
         neg_video_embeds, neg_audio_embeds = self._encode_text(DEFAULT_NEGATIVE_PROMPT)
-        # NOTE: mx.eval is MLX graph evaluation, NOT Python eval()
-        mx.eval(video_embeds, audio_embeds, neg_video_embeds, neg_audio_embeds)
+        _materialize(neg_video_embeds, neg_audio_embeds)
 
         # Free text encoder before loading heavy components
         self.text_encoder = None
