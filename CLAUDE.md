@@ -404,6 +404,33 @@ ltx-2-mlx ic-lora \
 
 Flags: `--lora PATH STRENGTH` (repeatable, supports HF repo IDs), `--video-conditioning PATH STRENGTH` (repeatable), `--conditioning-strength`, `--skip-stage-2`, `--image`.
 
+#### Static-scene I2V recipe (preserve identity)
+
+The `generate` modes (`--one-stage`, `--two-stage`, `--two-stages-hq`, `--distilled`) don't preserve the input image's identity over 4 sec with descriptive prompts — even with multi-anchor I2V (`--image PATH 0 1.0 --image PATH 96 1.0`) or STG=1.0. The model uses the anchor as initialization but generates freely afterwards, drifting toward the prompt's distribution. Same behavior upstream.
+
+The **upstream-iso pattern** for static-scene identity preservation is `ic-lora` with a control video replicated from the source image. Validated on Phoenix Q15 (1280×704×97 in 15 min on M2 Pro 32 GB, identity preserved throughout):
+
+```bash
+# 1. Generate canny control video by replicating the source image
+ffmpeg -y -loop 1 -i input_image.jpg \
+  -vf "scale=W:H:force_original_aspect_ratio=increase,crop=W:H,edgedetect=mode=canny:low=0.1:high=0.4,format=yuv420p" \
+  -frames:v N -r 24 -c:v libx264 -preset veryfast -crf 18 \
+  control_canny.mp4
+
+# 2. ic-lora with Union Control + canny + I2V anchor
+ltx-2-mlx ic-lora \
+  -p "your cinematic prompt..." \
+  --lora Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control 1.0 \
+  --video-conditioning control_canny.mp4 1.0 \
+  --image input_image.jpg \
+  --low-ram -W W -H H -f N --seed ... \
+  -o output.mp4
+```
+
+Why it works: `VideoConditionByReferenceLatent` (used by ic-lora) adds conditioning tokens **frame-by-frame** rather than just at the anchor positions. The replicated canny edges give the model a stable spatial structure throughout the clip, and the Union Control LoRA is trained to respect that structure. Faster than `--two-stage` modes (~4× shorter wall-clock) because distilled defaults (8+3 steps, no CFG = 1 forward/step).
+
+Alternatives via Union Control LoRA: depth maps (need external depth model like Depth-Anything-V2) or pose maps (OpenPose). Canny edges work for general scenes and require only ffmpeg.
+
 ### HDR IC-LoRA Example
 
 ```bash
