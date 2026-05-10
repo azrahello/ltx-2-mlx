@@ -33,9 +33,7 @@ from ltx_core_mlx.components.guiders import (
     create_multimodal_guider_factory,
 )
 from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
-from ltx_core_mlx.conditioning.types.latent_cond import VideoConditionByLatentIndex
 from ltx_core_mlx.model.transformer.model import X0Model
-from ltx_core_mlx.utils.image import prepare_image_for_encoding
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import (
     compute_audio_positions,
@@ -113,6 +111,7 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
         cfg_scale: float = DEFAULT_CFG_SCALE,
         stg_scale: float = 0.0,
         image: str | None = None,
+        images=None,
         video_guider_params: MultiModalGuiderParams | None = None,
         audio_guider_params: MultiModalGuiderParams | None = None,
         tap: callable | None = None,
@@ -128,7 +127,9 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
             num_steps: Denoising steps (default: 30).
             cfg_scale: CFG guidance scale (default: 3.0).
             stg_scale: STG guidance scale (default: 0.0).
-            image: Optional reference image for I2V conditioning.
+            image: Optional reference image for I2V (legacy single-anchor).
+            images: Optional list of :class:`ImageConditioningInput` for
+                multi-anchor I2V (matches upstream ``combined_image_conditionings``).
             video_guider_params: Optional full guider params for video.
             audio_guider_params: Optional full guider params for audio.
             tap: Optional per-step instrumentation hook.
@@ -153,21 +154,24 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
         video_positions = compute_video_positions(F, H, W)
         audio_positions = compute_audio_positions(audio_T)
 
-        # I2V conditioning at target resolution
-        conditionings: list[VideoConditionByLatentIndex] = []
-        if image is not None:
-            enc_h = H * 32
-            enc_w = W * 32
-            img_tensor = prepare_image_for_encoding(image, enc_h, enc_w)
-            img_tensor = img_tensor[:, :, None, :, :]
-            ref_latent = self.vae_encoder.encode(img_tensor)
-            ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
-            conditionings.append(
-                VideoConditionByLatentIndex(
-                    frame_indices=[0],
-                    clean_latent=ref_tokens,
-                    strength=1.0,
-                )
+        # I2V conditioning at target resolution. ``images`` is the upstream-iso
+        # multi-anchor list; ``image`` is the legacy single-image shorthand.
+        from ltx_pipelines_mlx.utils._orchestration import combined_image_conditionings
+        from ltx_pipelines_mlx.utils.args import ImageConditioningInput
+
+        enc_h = H * 32
+        enc_w = W * 32
+        resolved_images = list(images) if images else []
+        if image is not None and not resolved_images:
+            resolved_images = [ImageConditioningInput(path=image, frame_idx=0, strength=1.0)]
+        conditionings: list = []
+        if resolved_images:
+            conditionings = combined_image_conditionings(
+                resolved_images,
+                enc_h=enc_h,
+                enc_w=enc_w,
+                spatial_dims=(F, H, W),
+                video_encoder=self.vae_encoder,
             )
 
         video_state = create_noised_state(
@@ -260,6 +264,7 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
         cfg_scale: float = DEFAULT_CFG_SCALE,
         stg_scale: float = 0.0,
         image: str | None = None,
+        images=None,
         video_guider_params: MultiModalGuiderParams | None = None,
         audio_guider_params: MultiModalGuiderParams | None = None,
         **_unused_kwargs,
@@ -280,6 +285,7 @@ class TI2VidOneStagePipeline(TI2VidTwoStagesPipeline):
             cfg_scale=cfg_scale,
             stg_scale=stg_scale,
             image=image,
+            images=images,
             video_guider_params=video_guider_params,
             audio_guider_params=audio_guider_params,
         )

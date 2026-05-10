@@ -263,7 +263,20 @@ examples:
     a2v.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 steps (default: 3)")
     a2v.add_argument("--cfg-scale", type=float, default=None, help="CFG guidance scale (default: 3.0)")
     a2v.add_argument("--stg-scale", type=float, default=None, help="STG guidance scale (default: 0.0)")
-    a2v.add_argument("--image", "-i", default=None, help="Reference image for I2V conditioning (optional)")
+    a2v.add_argument(
+        "--image",
+        "-i",
+        action=_ImageAction,
+        nargs="+",
+        dest="images",
+        default=None,
+        metavar="ARG",
+        help=(
+            "Reference image for I2V. Form: PATH [FRAME_IDX STRENGTH [CRF]]. "
+            "Repeatable to anchor multiple frames. PATH alone defaults to "
+            "FRAME_IDX=0 STRENGTH=1.0 (legacy single-image)."
+        ),
+    )
 
     # --- retake ---
     ret = sub.add_parser("retake", help="Regenerate a time segment of an existing video")
@@ -331,7 +344,16 @@ examples:
         required=True,
         help="Reference control video and strength (repeatable). Example: --video-conditioning depth.mp4 1.0",
     )
-    ic.add_argument("--image", "-i", default=None, help="Optional reference image for I2V conditioning")
+    ic.add_argument(
+        "--image",
+        "-i",
+        action=_ImageAction,
+        nargs="+",
+        dest="images",
+        default=None,
+        metavar="ARG",
+        help=("Reference image for I2V. Form: PATH [FRAME_IDX STRENGTH [CRF]]. Repeatable to anchor multiple frames."),
+    )
     ic.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 denoising steps")
     ic.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 denoising steps")
     ic.add_argument(
@@ -368,7 +390,16 @@ examples:
         default=None,
         help="Optional reference control video(s) and strength (repeatable). Pure T2V HDR if omitted.",
     )
-    hdr.add_argument("--image", "-i", default=None, help="Optional reference image for I2V conditioning")
+    hdr.add_argument(
+        "--image",
+        "-i",
+        action=_ImageAction,
+        nargs="+",
+        dest="images",
+        default=None,
+        metavar="ARG",
+        help=("Reference image for I2V. Form: PATH [FRAME_IDX STRENGTH [CRF]]. Repeatable to anchor multiple frames."),
+    )
     hdr.add_argument("--stage1-steps", type=int, default=None, help="Stage 1 denoising steps")
     hdr.add_argument("--stage2-steps", type=int, default=None, help="Stage 2 denoising steps")
     hdr.add_argument(
@@ -662,7 +693,7 @@ def _cmd_a2v(args: argparse.Namespace) -> None:
         num_frames=args.frames,
         fps=args.fps,
         seed=args.seed,
-        image=args.image,
+        images=args.images,
         audio_start_time=args.audio_start,
     )
     if args.stage1_steps is not None:
@@ -845,11 +876,6 @@ def _cmd_ic_lora(args: argparse.Namespace) -> None:
         low_ram_streaming=getattr(args, "low_ram", False),
     )
 
-    # Build image conditioning if provided
-    images = None
-    if args.image:
-        images = [(args.image, 0, 1.0)]
-
     pipe.generate_and_save(
         prompt=args.prompt,
         output_path=args.output,
@@ -860,7 +886,7 @@ def _cmd_ic_lora(args: argparse.Namespace) -> None:
         seed=args.seed,
         stage1_steps=args.stage1_steps,
         stage2_steps=args.stage2_steps,
-        images=images,
+        images=args.images,
         conditioning_attention_strength=args.conditioning_strength,
         skip_stage_2=args.skip_stage_2,
     )
@@ -892,10 +918,6 @@ def _cmd_hdr_ic_lora(args: argparse.Namespace) -> None:
         low_ram_streaming=getattr(args, "low_ram", False),
     )
 
-    images = None
-    if args.image:
-        images = [(args.image, 0, 1.0)]
-
     pipe.generate_and_save(
         prompt=args.prompt,
         output_path=args.output,
@@ -906,7 +928,7 @@ def _cmd_hdr_ic_lora(args: argparse.Namespace) -> None:
         seed=args.seed,
         stage1_steps=args.stage1_steps,
         stage2_steps=args.stage2_steps,
-        images=images,
+        images=args.images,
         conditioning_attention_strength=args.conditioning_strength,
         skip_stage_2=args.skip_stage_2,
     )

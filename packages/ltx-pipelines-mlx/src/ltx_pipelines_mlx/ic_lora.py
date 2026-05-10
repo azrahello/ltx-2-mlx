@@ -24,9 +24,6 @@ from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
 from ltx_core_mlx.conditioning.types.attention_strength_wrapper import (
     ConditioningItemAttentionStrengthWrapper,
 )
-from ltx_core_mlx.conditioning.types.latent_cond import (
-    VideoConditionByLatentIndex,
-)
 from ltx_core_mlx.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
 from ltx_core_mlx.loader import (
     LTXV_LORA_COMFY_RENAMING_MAP,
@@ -37,7 +34,6 @@ from ltx_core_mlx.loader import (
 )
 from ltx_core_mlx.model.transformer.model import X0Model
 from ltx_core_mlx.model.upsampler import LatentUpsampler
-from ltx_core_mlx.utils.image import prepare_image_for_encoding
 from ltx_core_mlx.utils.memory import aggressive_cleanup
 from ltx_core_mlx.utils.positions import compute_audio_positions, compute_audio_token_count, compute_video_positions
 from ltx_core_mlx.utils.video import load_video_frames_normalized
@@ -251,20 +247,29 @@ class ICLoraPipeline(BasePipeline):
 
         conditionings: list[object] = []
 
-        # Image conditionings (I2V)
+        # Image conditionings (I2V) — upstream-iso multi-anchor pattern.
+        # frame_idx==0 → VideoConditionByLatentIndex (replace);
+        # frame_idx>0 → VideoConditionByKeyframeIndex (guide).
         if images:
-            for img_path, frame_idx, strength in images:
-                img_tensor = prepare_image_for_encoding(img_path, height, width)
-                img_tensor = img_tensor[:, :, None, :, :]
-                img_latent = self.vae_encoder.encode(img_tensor)
-                img_tokens = img_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
-                conditionings.append(
-                    VideoConditionByLatentIndex(
-                        frame_indices=[frame_idx],
-                        clean_latent=img_tokens,
-                        strength=strength,
-                    )
+            from ltx_pipelines_mlx.utils._orchestration import combined_image_conditionings
+            from ltx_pipelines_mlx.utils.args import ImageConditioningInput
+
+            normalized = [
+                img if isinstance(img, ImageConditioningInput) else ImageConditioningInput(*img) for img in images
+            ]
+            # Stage spatial latent dims (F, H, W) for keyframe positions
+            from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
+
+            F_lat, H_lat, W_lat = compute_video_latent_shape(num_frames, height, width)
+            conditionings.extend(
+                combined_image_conditionings(
+                    normalized,
+                    enc_h=height,
+                    enc_w=width,
+                    spatial_dims=(F_lat, H_lat, W_lat),
+                    video_encoder=self.vae_encoder,
                 )
+            )
 
         # IC-LoRA reference video conditionings
         scale = self.reference_downscale_factor
@@ -483,21 +488,28 @@ class ICLoraPipeline(BasePipeline):
         enc_h_full = H_full * 32
         enc_w_full = W_full * 32
 
-        # Encode I2V images at upscaled resolution (if any) before freeing encoder
+        # Encode I2V images at upscaled resolution (if any) before freeing encoder.
+        # Upstream-iso multi-anchor pattern: frame_idx==0 → LatentIndex, else → KeyframeIndex.
         conditionings_2 = []
         if images:
-            for img_path, frame_idx, strength in images:
-                img_tensor = prepare_image_for_encoding(img_path, enc_h_full, enc_w_full)
-                img_tensor = img_tensor[:, :, None, :, :]
-                ref_latent = self.vae_encoder.encode(img_tensor)
-                ref_tokens = ref_latent.transpose(0, 2, 3, 4, 1).reshape(1, -1, 128)
-                conditionings_2.append(
-                    VideoConditionByLatentIndex(
-                        frame_indices=[frame_idx],
-                        clean_latent=ref_tokens,
-                        strength=strength,
-                    )
+            from ltx_pipelines_mlx.utils._orchestration import combined_image_conditionings
+            from ltx_pipelines_mlx.utils.args import ImageConditioningInput
+
+            normalized = [
+                img if isinstance(img, ImageConditioningInput) else ImageConditioningInput(*img) for img in images
+            ]
+            from ltx_core_mlx.components.patchifiers import compute_video_latent_shape
+
+            F_full, H_full_lat, W_full_lat = compute_video_latent_shape(num_frames, enc_h_full, enc_w_full)
+            conditionings_2.extend(
+                combined_image_conditionings(
+                    normalized,
+                    enc_h=enc_h_full,
+                    enc_w=enc_w_full,
+                    spatial_dims=(F_full, H_full_lat, W_full_lat),
+                    video_encoder=self.vae_encoder,
                 )
+            )
 
         # Free VAE encoder + upsampler + fused DiT before loading clean transformer
         if self.low_memory:
