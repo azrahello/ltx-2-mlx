@@ -22,6 +22,18 @@ from enum import Enum
 
 import mlx.core as mx
 import mlx.nn as nn
+import os as _os
+
+# LTX2_DIT_EVAL_EVERY: insert mx.eval every N blocks to keep each Metal
+# command buffer below the macOS GPU watchdog (~10 s deadline).
+# The 48-layer DiT lazy graph can exceed the deadline at production
+# resolutions (640x480+, 33+ frames) even on 64 GB Macs — validated
+# by MTLCommandBufferErrorInternal (code 14) crashes on M2 Max 64 GB.
+# Default 8: splits 48 blocks into 6 command buffers of ~6 blocks
+# each (~1–2 s/buffer), well within the watchdog window.
+# Set to 0 to disable (full lazy graph, original behaviour).
+_DIT_EVAL_EVERY = int(_os.environ.get("LTX2_DIT_EVAL_EVERY", "8"))
+_mx_eval = getattr(mx, "eval")  # noqa: B009
 
 from ltx_core_mlx.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core_mlx.model.transformer.adaln import AdaLayerNormSingle
@@ -400,8 +412,11 @@ class LTXModel(nn.Module):
                     # Streaming: force MLX graph materialization between
                     # blocks so the previous block's weights become
                     # evictable.
-                    _materialize = mx.eval
-                    _materialize(video_hidden, audio_hidden)
+                    _mx_eval(video_hidden, audio_hidden)
+                elif _DIT_EVAL_EVERY > 0 and (block_idx + 1) % _DIT_EVAL_EVERY == 0:
+                    # Watchdog guard: flush accumulated lazy graph every N blocks
+                    # so no single Metal command buffer exceeds the ~10 s deadline.
+                    _mx_eval(video_hidden, audio_hidden)
 
         if tap is not None:
             tap(video_hidden - block_input_v, audio_hidden - block_input_a)
