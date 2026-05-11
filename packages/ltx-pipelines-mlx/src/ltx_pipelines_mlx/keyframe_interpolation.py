@@ -104,6 +104,7 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
         prompt: str,
         keyframe_images: list[Image.Image | str],
         keyframe_indices: list[int],
+        keyframe_strengths: list[float] | None = None,
         height: int = 480,
         width: int = 704,
         num_frames: int = 97,
@@ -122,6 +123,9 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
             prompt: Text prompt.
             keyframe_images: List of keyframe images (PIL or paths).
             keyframe_indices: Pixel frame indices for each keyframe (0-based).
+            keyframe_strengths: Per-keyframe conditioning strength in ``[0, 1]``
+                (matches upstream ``ImageConditioningInput.strength``). Defaults
+                to ``1.0`` for each keyframe.
             height: Final video height.
             width: Final video width.
             num_frames: Total number of pixel frames.
@@ -135,6 +139,14 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
         Returns:
             Tuple of (video_latent, audio_latent) at full resolution.
         """
+        if keyframe_strengths is None:
+            keyframe_strengths = [1.0] * len(keyframe_images)
+        elif len(keyframe_strengths) != len(keyframe_images):
+            raise ValueError(
+                f"keyframe_strengths length ({len(keyframe_strengths)}) must match "
+                f"keyframe_images length ({len(keyframe_images)})"
+            )
+
         # Compute half-res latent dimensions (matching reference: height//2, width//2
         # with integer division by spatial compression factor 32).
         half_h, half_w = height // 2, width // 2
@@ -211,9 +223,10 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
                 keyframe_latent=tokens,
                 spatial_dims=(F, H_half, W_half),
                 fps=fps,
+                strength=kf_strength,
                 num_pixel_frames=1,
             )
-            for tokens, kf_idx in zip(kf_tokens_half, keyframe_indices)
+            for tokens, kf_idx, kf_strength in zip(kf_tokens_half, keyframe_indices, keyframe_strengths)
         ]
 
         # Build noised state via the canonical upstream order:
@@ -334,9 +347,10 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
                 keyframe_latent=tokens,
                 spatial_dims=(F, H_full, W_full),
                 fps=fps,
+                strength=kf_strength,
                 num_pixel_frames=1,
             )
-            for tokens, kf_idx in zip(kf_tokens_full, keyframe_indices)
+            for tokens, kf_idx, kf_strength in zip(kf_tokens_full, keyframe_indices, keyframe_strengths)
         ]
 
         video_state_2 = create_noised_state(
@@ -392,6 +406,7 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
         output_path: str,
         keyframe_images: list[Image.Image | str] | None = None,
         keyframe_indices: list[int] | None = None,
+        keyframe_strengths: list[float] | None = None,
         height: int = 480,
         width: int = 704,
         num_frames: int = 97,
@@ -432,6 +447,7 @@ class KeyframeInterpolationPipeline(TI2VidTwoStagesPipeline):
             prompt=prompt,
             keyframe_images=keyframe_images,
             keyframe_indices=keyframe_indices,
+            keyframe_strengths=keyframe_strengths,
             height=height,
             width=width,
             num_frames=num_frames,
