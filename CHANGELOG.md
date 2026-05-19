@@ -12,6 +12,24 @@ stability guarantees.
 
 ## [Unreleased]
 
+## [0.14.5] - 2026-05-19
+
+CLI phase-marker coverage gap on the distilled two-stage path. The
+``[Encoding prompt] ... done in X.Xs`` marker introduced in v0.13.1
+was emitted by every pipeline that goes through ``BasePipeline``'s
+text-encoding helper, but ``DistilledPipeline.generate_two_stage``
+encodes the (positive-only) prompt inline and was missed in the v0.13.1
+audit. ``[Loading text encoder]`` was emitted, then silence until
+``[Loading DiT]``.
+
+### Fixed
+
+- Wrap ``_encode_text`` + ``_materialize`` in ``DistilledPipeline.generate_two_stage``
+  with the ``phase("Encoding prompt", ...)`` context manager so the
+  encoding duration is reported on stderr like every other pipeline.
+  Caught by external contributor [@plz12345](https://github.com/plz12345)
+  in PR #28.
+
 ## [0.14.4] - 2026-05-14
 
 Apple Silicon Metal watchdog hardening for the denoise loop. On
