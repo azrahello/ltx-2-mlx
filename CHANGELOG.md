@@ -12,6 +12,77 @@ stability guarantees.
 
 ## [Unreleased]
 
+## [0.14.6] - 2026-05-20
+
+Automatic temporal tiling for the video VAE decoder. The block-3
+DepthToSpaceUpsample intermediate (``(B, 512, 4F, 4H, 4W)`` in bf16)
+dominates peak Metal activation memory at HD or long durations and
+pushed 32 GB Macs into swap on 720p+ runs beyond ~20s — even when the
+rest of the pipeline (transformer streamed, decoders loaded on demand)
+fit comfortably.
+
+### Added
+
+- ``_compute_decode_tiling(latent_shape, frame_rate)`` in
+  ``ltx_core_mlx.model.video_vae.video_vae``: pure-arithmetic helper
+  that derives a ``TilingConfig`` from the latent shape and the
+  ``LTX2_VAE_DECODE_BUDGET_GB`` budget (default ``8.0``). Returns
+  ``None`` when the full video already fits, so the no-tiling path
+  has zero overhead at common resolutions. Tile size and overlap
+  scale with frame rate (~1 second of pixel frames of overlap).
+- ``VideoDecoder.decode_and_stream`` (pipelines wrapper) now prints
+  ``[vae-decode tiled: tile_frames=N overlap=K]`` to stderr when tiling
+  kicks in, gated on the pipeline's ``verbose`` flag.
+
+### Changed
+
+- ``VideoDecoder.tiled_decode`` (core) inserts ``mx.eval`` +
+  ``aggressive_cleanup`` after each tile decode and after each
+  accumulation step so prior-tile activations are freed before the
+  next tile begins.
+- ``VideoDecoder.decode`` gains an opt-in ``_materialize_stages``
+  keyword-only flag (default ``False``) that forces ``mx.eval`` between
+  the four upsample stages. Only set ``True`` by ``tiled_decode`` —
+  the no-tiling fast path keeps full kernel fusion across upsample
+  stages.
+- ``A2VidPipelineTwoStage._upscale_and_optionally_encode`` was
+  reaching into ``self.vae_decoder.decode_and_stream`` directly;
+  routed through ``self.video_decoder_block.decode_and_stream`` like
+  every other pipeline. Removes a stale ``assert self.vae_decoder
+  is not None`` (the block's ``load()`` is idempotent) and gives a2v
+  the same stderr marker as the rest.
+
+### Note on numerical equivalence
+
+Tiled decode is **not** bit-equivalent to a non-tiled decode at the
+same configuration. The video VAE's causal ``Conv3dBlock``
+(``convolution.py:62-66``) replicates each tile's first frame for
+temporal padding, so isolated tiles diverge from the full-decode
+context at boundaries. The trapezoidal blend mask smooths the seam
+visually but does not reconstruct the exact signal. This is intrinsic
+to any tiled-VAE-decode and matches the upstream behaviour — users
+switching into tiled mode at 1080p+ should expect minor boundary
+drift vs. the same config with enough RAM to skip tiling.
+
+### Benchmarks (one run each, ``--distilled`` 8/3 at 480p × 15s × 25fps)
+
+| stage | no-tile | tiled (opt-in via large input) | Δ |
+|---|---|---|---|
+| decode | 124.1s | 131.4s | +5.9% |
+| total | 841.0s | 881.9s | +4.9% |
+
+No-tiling fast path is unchanged.
+
+### Credit
+
+End-to-end PR by [@plz12345](https://github.com/plz12345) in
+[#25](https://github.com/dgrauet/ltx-2-mlx/pull/25), iterated through
+two rounds of review covering env-var budget gating, scoped
+``BrokenPipeError`` handling, fp32→bf16 budget correction, stderr
+marker plumbing, a2v consistency cleanup, and the multi-tile
+integration test. Production-validated on plz12345's M5 MacBook Air
+32 GB for a week prior to submission.
+
 ## [0.14.5] - 2026-05-19
 
 CLI phase-marker coverage gap on the distilled two-stage path. The
